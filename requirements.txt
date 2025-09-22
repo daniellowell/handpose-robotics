@@ -1,0 +1,8 @@
+# Python package requirements for handpose project
+# Automatically tracked pip installations from uhand_py312 environment
+numpy==1.26.4
+mediapipe==0.10.21
+opencv-python==4.10.0.84
+pyserial==3.5
+flake8>=7.3.0
+pylint>=3.3.0

@@ -1,0 +1,10 @@
+{
+  "PORT": "/dev/tty.usbserial-CHANGE_ME",
+  "BAUD": 9600,
+  "CAM_INDEX": 0,
+  "MODEL_PATH": "hand_landmarker.task",
+  "NUM_HANDS": 1,
+  "SMOOTH_ALPHA": 0.7,
+  "SEND_HZ": 20,
+  "PAN_TILT_DEFAULT": 180
+}
