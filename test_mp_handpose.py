@@ -8,9 +8,6 @@ from pathlib import Path
 import cv2 as cv
 import mediapipe as mp
 import numpy as np
-import serial
-
-from uhand_protocol import pack_set_angles
 
 # ---------- CONFIG ----------
 CONFIG_PATH = Path(__file__).with_name("config.json")
@@ -159,32 +156,6 @@ options = HandLandmarkerOptions(
     min_tracking_confidence=0.6,
 )
 
-# ---------- Landmark -> Servo mapping ----------
-TIP = [4, 8, 12, 16, 20]  # thumb..pinky tip indices
-MCP = [2, 5, 9, 13, 17]  # corresponding knuckles
-smooth = np.array([90] * 5, dtype=float)
-
-
-def landmarks_to_angles(landmarks):
-    """
-    landmarks: list of 21 normalized landmarks (x, y in [0, 1]).
-    We use vertical distance (tip below knuckle -> more flexed).
-    Scale to 0..180 and clamp.
-    """
-    output_angles = []
-    for tip_idx, mcp_idx in zip(TIP, MCP):
-        dy_delta = landmarks[tip_idx].y - landmarks[mcp_idx].y
-        angle = int(np.clip(90 - dy_delta * 400, 0, 180))
-        output_angles.append(angle)
-    return output_angles
-
-
-def ema5(new_angles):
-    global smooth
-    smooth = SMOOTH_ALPHA * np.array(new_angles, float) + (
-        1 - SMOOTH_ALPHA
-    ) * smooth
-    return [int(value) for value in smooth]
 
 
 # ---------- Main ----------
@@ -192,9 +163,6 @@ def main():
     cap = cv.VideoCapture(CAM_INDEX)
     if not cap.isOpened():
         raise RuntimeError("Cannot open camera")
-
-    ser = serial.Serial(PORT, BAUD, timeout=0.05)
-    last_send = 0.0
 
     with HandLandmarker.create_from_options(options) as landmarker:
         fpsm = FPSMeter()
@@ -224,13 +192,8 @@ def main():
             if has_hand_landmarks and len(result.hand_landmarks) > 0:
                 landmarks = result.hand_landmarks[0]
                 draw_hand_overlay(frame_bgr, landmarks)
-                angles = ema5(landmarks_to_angles(landmarks))
 
             now = time.time()
-            if angles is not None and (now - last_send) >= 1.0 / SEND_HZ:
-                packet = pack_set_angles(angles + [PAN_TILT_DEFAULT])
-                ser.write(packet)
-                last_send = now
 
             if now - last_tx >= 1.0:
                 tx_hz = tx_count / (now - last_tx)
@@ -251,7 +214,6 @@ def main():
             if (cv.waitKey(1) & 0xFF) == 27:  # ESC
                 break
 
-    ser.close()
     cap.release()
     cv.destroyAllWindows()
 
