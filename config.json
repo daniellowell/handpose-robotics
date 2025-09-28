@@ -1,5 +1,5 @@
 {
-  "PORT": "/dev/tty.usbserial-CHANGE_ME",
+  "PORT": "/dev/tty.usbserial-BG02MHSO",
   "BAUD": 9600,
   "CAM_INDEX": 0,
   "MODEL_PATH": "hand_landmarker.task",
