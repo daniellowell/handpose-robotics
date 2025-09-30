@@ -27,25 +27,25 @@ import numpy as np
 import serial
 
 # ------------------ User defaults ------------------
-PORT = "/dev/tty.usbmodem1101"   # <-- set your UNO serial port
-BAUD = 9600
-MODEL_PATH = "hand_landmarker.task"
-CAM_INDEX = 0
-USE_AVFOUNDATION = True          # macOS camera backend
-SEND_HZ = 20
-SMOOTH_ALPHA = 0.6
-MIRROR_PREVIEW = True            # mirror camera only (not math)
-PRINT_TX = True                  # print each outbound serial line
+PORT = "/dev/tty.usbmodem1101"   # Serial device for the UNO (update per environment)
+BAUD = 9600                       # Baud rate expected by the Arduino firmware
+MODEL_PATH = "hand_landmarker.task"  # MediaPipe model path
+CAM_INDEX = 0                     # Default camera index used by OpenCV
+USE_AVFOUNDATION = True           # Prefer macOS AVFoundation backend when present
+SEND_HZ = 20                      # Desired serial update rate (Hz)
+SMOOTH_ALPHA = 0.6                # EMA smoothing factor for finger percentages
+MIRROR_PREVIEW = True             # Mirror preview only; math still uses original orientation
+PRINT_TX = True                   # Emit outbound serial lines to stdout
 
 # Constants
-FLEXION_OPEN_THRESHOLD = -0.15
-FLEXION_CLOSE_THRESHOLD = 0.30
-ESC_KEY = 27
-SPACE_KEY = 32
-MIN_NORM_THRESHOLD = 1e-6
-DEFAULT_NORM = 1e-4
-SERIAL_COMMAND_DELAY = 0.05
-CAL_SETTLE_REPEATS = 4
+FLEXION_OPEN_THRESHOLD = -0.15    # Normalised TIP-MCP delta treated as fully open (0 %)
+FLEXION_CLOSE_THRESHOLD = 0.30    # Normalised TIP-MCP delta treated as fully closed (100 %)
+ESC_KEY = 27                      # ESC keycode for OpenCV loop exit
+SPACE_KEY = 32                    # Spacebar keycode used to advance fingers during calibration
+MIN_NORM_THRESHOLD = 1e-6         # Lower guard for hand span calculation
+DEFAULT_NORM = 1e-4               # Fallback normaliser when span is extremely small
+SERIAL_COMMAND_DELAY = 0.05       # Pause between calibration packets to let servos settle
+CAL_SETTLE_REPEATS = 4            # Number of repeated calibration sends to overcome EMA smoothing
 
 
 FINGER_NAMES = ["thumb","index","middle","ring","pinky","swivel"]
@@ -78,6 +78,7 @@ HAND_CONNECTIONS = [
     (13,17),(17,18),(18,19),(19,20),
 ]
 
+# Visualise the MediaPipe landmarks so the operator can see what the tracker detects.
 def draw_hand_overlay(frame_bgr, lm):
     h, w = frame_bgr.shape[:2]
     for a,b in HAND_CONNECTIONS:
@@ -88,6 +89,7 @@ def draw_hand_overlay(frame_bgr, lm):
         x, y = int(p.x*w), int(p.y*h)
         cv.circle(frame_bgr, (x,y), 4, (255,255,255), -1)
 
+# Rolling FPS measurement used for the HUD overlay.
 class FPSMeter:
     def __init__(self, span=30): self.t, self.span = [], span
     def tick(self):
@@ -98,12 +100,14 @@ class FPSMeter:
         dt = self.t[-1]-self.t[0]
         return (len(self.t)-1)/dt if dt>0 else 0.0
 
+# Try AVFoundation first (macOS), then fall back to the default backend.
 def open_camera(index=0):
     if USE_AVFOUNDATION:
         cap = cv.VideoCapture(index, cv.CAP_AVFOUNDATION)
         if cap.isOpened(): return cap
     return cv.VideoCapture(index)
 
+# Simple vector EMA used to smooth noisy flexion percentages.
 def ema_vec(prev, new, alpha=0.6):
     prev = np.asarray(prev, float); new = np.asarray(new, float)
     return (alpha*new + (1.0-alpha)*prev).tolist()
@@ -133,6 +137,7 @@ def flexion_percent(landmarks):
     return pcts
 
 # ---------------------- Serial ----------------------
+# Send a newline-terminated command to the Arduino and optionally log diagnostics.
 def send_line(ser, text, print_tx=PRINT_TX, log_fn=None, log_event_name="serial_write", log_data=None):
     try:
         ser.write(text.encode())
@@ -149,6 +154,7 @@ def send_line(ser, text, print_tx=PRINT_TX, log_fn=None, log_event_name="serial_
         print(f"[WARN] serial write failed: {e}")
 
 # -------------------- Live mode ---------------------
+# Capture MediaPipe landmarks, map them to servo percentages, and stream packets.
 def run_live(args):
     log_handle = None
     if args.log_json:
@@ -243,6 +249,7 @@ def run_live(args):
                     result = landmarker.detect_for_video(mp_image, ts_ms)
                     if result and result.hand_landmarks:
                         lm = result.hand_landmarks[0]
+                        # Convert landmark geometry into 0-100 % flexion values per finger.
                         pcts = flexion_percent(lm)
                         draw_hand_overlay(frame, lm)
                 except Exception as exc:
@@ -261,8 +268,10 @@ def run_live(args):
                     if args.print_tx:
                         raw_vals = ", ".join(f"{v:.2f}" for v in pcts)
                         print(f"[RAW] {raw_vals}")
+                    # Blend raw measurements to suppress jitter before converting to servo targets.
                     smooth = ema_vec(smooth, pcts, args.smooth)
                     if (now - last_send) >= send_period:
+                        # Percentages must be integers (0-100) for the Arduino firmware.
                         vals = [int(round(v)) for v in smooth]
                         line = "P:{},{},{},{},{},{}\n".format(*vals)
                         log_payload = {
@@ -324,8 +333,10 @@ Calibration keys (targeting ONE finger at a time):
 Tip: keep movements between comfortable mechanical limits (no buzzing).
 """
 
+# Clamp helper used throughout calibration to keep servo angles safe.
 def clamp(v, lo=0, hi=180): return max(lo, min(hi, v))
 
+# Serial-only calibration loop; lets the user mark servo min/max ranges.
 def run_calibrate(args):
     log_handle = None
     if args.log_json:
@@ -348,9 +359,9 @@ def run_calibrate(args):
 
     # Serial only (no MediaPipe/camera needed)
     ser = None
-    deg = [90, 90, 90, 90, 90, 90]
-    mins = [None] * 6
-    maxs = [None] * 6
+    deg = [90, 90, 90, 90, 90, 90]  # Current degrees we are commanding per finger
+    mins = [None] * 6               # Collected MIN (open) angles per finger index
+    maxs = [None] * 6               # Collected MAX (closed) angles per finger index
     finger = 0
 
     try:
@@ -455,6 +466,7 @@ def run_calibrate(args):
                         if m is not None and M is not None:
                             lo, hi = sorted((m, M))
                             ranges.append({"finger": i, "lo": lo, "hi": hi})
+                            # Persist the finger's calibrated range to firmware one finger at a time.
                             cmd = f"CAL {i} {lo} {hi}\n"
                             send_line(ser, cmd, args.print_tx, log_event, "calibrate_send_cal",
                                       {"finger": i, "lo": lo, "hi": hi})
