@@ -19,6 +19,9 @@ import argparse
 import json
 import math
 import os
+import platform
+import signal
+import sys
 import time
 
 # Third-party imports
@@ -44,8 +47,17 @@ ESC_KEY = 27                      # ESC keycode for OpenCV loop exit
 SPACE_KEY = 32                    # Spacebar keycode used to advance fingers during calibration
 MIN_NORM_THRESHOLD = 1e-6         # Lower guard for hand span calculation
 DEFAULT_NORM = 1e-4               # Fallback normaliser when span is extremely small
+SERIAL_LIVE_TIMEOUT = 0.05        # Serial timeout while streaming live pose data
+SERIAL_CAL_TIMEOUT = 0.1          # Serial timeout during calibration routine
 SERIAL_COMMAND_DELAY = 0.05       # Pause between calibration packets to let servos settle
 CAL_SETTLE_REPEATS = 4            # Number of repeated calibration sends to overcome EMA smoothing
+CALIB_CLAMP_MIN = 0               # Lower bound for servo angles during calibration
+CALIB_CLAMP_MAX = 180             # Upper bound for servo angles during calibration
+CALIB_START_DEG = 90              # Neutral angle applied when calibration starts/resets
+SWIVEL_NEUTRAL_PERCENT = 50.0     # Default percent value for the swivel channel
+MP_MIN_HAND_DETECTION_CONF = 0.6  # MediaPipe minimum detection confidence
+MP_MIN_HAND_PRESENCE_CONF = 0.6   # MediaPipe minimum presence confidence
+MP_MIN_TRACKING_CONF = 0.6        # MediaPipe minimum tracking confidence
 
 
 FINGER_NAMES = ["thumb","index","middle","ring","pinky","swivel"]
@@ -77,6 +89,27 @@ HAND_CONNECTIONS = [
     (9,13),(13,14),(14,15),(15,16),
     (13,17),(17,18),(18,19),(19,20),
 ]
+
+def module_version(mod, attr="__version__", fallback_attr="VERSION", default="unknown"):
+    if mod is None:
+        return default
+    if hasattr(mod, attr):
+        return getattr(mod, attr)
+    if hasattr(mod, fallback_attr):
+        return getattr(mod, fallback_attr)
+    return default
+
+
+def build_env_snapshot(port):
+    return {
+        "python": sys.version.split()[0],
+        "platform": platform.platform(),
+        "opencv": module_version(cv),
+        "mediapipe": module_version(mp) if MP_AVAILABLE else "missing",
+        "pyserial": module_version(serial),
+        "port": port,
+    }
+
 
 # Visualise the MediaPipe landmarks so the operator can see what the tracker detects.
 def draw_hand_overlay(frame_bgr, lm):
@@ -133,7 +166,7 @@ def flexion_percent(landmarks):
         pct = max(0.0, min(100.0, pct))
         pcts.append(pct)
 
-    pcts.append(50.0)  # swivel neutral (adjust if you want wrist yaw mapping)
+    pcts.append(SWIVEL_NEUTRAL_PERCENT)  # swivel neutral (adjust if you want wrist yaw mapping)
     return pcts
 
 # ---------------------- Serial ----------------------
@@ -180,20 +213,51 @@ def run_live(args):
     hand_present_prev = None
     frame_index = 0
 
-    try:
-        log_event("live_start", port=args.port, baud=args.baud, cam=args.cam,
-                  send_hz=args.send_hz, smooth=args.smooth, mirror=MIRROR_PREVIEW)
+    env_snapshot = build_env_snapshot(args.port)
+    log_event("env_snapshot", **env_snapshot)
 
+    shutdown_requested = False
+    sent_neutral = False
+    original_handlers = {}
+
+    def handle_signal(signum, frame):
+        nonlocal shutdown_requested, sent_neutral
+        if shutdown_requested:
+            return
+        shutdown_requested = True
+        log_event("shutdown", signal=signum)
+        if ser and ser.is_open and not sent_neutral:
+            send_line(ser, "NEUTRAL\n", args.print_tx, log_event, "serial_send", {"reason": "shutdown"})
+            sent_neutral = True
+        cv.destroyAllWindows()
+        raise KeyboardInterrupt()
+
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        original_handlers[sig] = signal.getsignal(sig)
+        signal.signal(sig, handle_signal)
+
+    try:
         if not MP_AVAILABLE:
             log_event("live_error", reason="mediapipe_unavailable")
             print("ERROR: MediaPipe not available. Install with: pip install mediapipe")
             return
         if not os.path.exists(args.model):
-            log_event("live_error", reason="model_missing", model=args.model)
+            log_event("model_missing", path=args.model)
             print(f"Missing model file: {args.model}")
-            return
+            print("Download with:")
+            print("  curl -o hand_landmarker.task https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task")
+            sys.exit(1)
 
-        ser = serial.Serial(args.port, args.baud, timeout=0.05)
+        try:
+            model_size = os.path.getsize(args.model)
+        except OSError:
+            model_size = None
+        log_event("model_loaded", path=args.model, size=model_size)
+
+        log_event("live_start", port=args.port, baud=args.baud, cam=args.cam,
+                  send_hz=args.send_hz, smooth=args.smooth, mirror=MIRROR_PREVIEW)
+
+        ser = serial.Serial(args.port, args.baud, timeout=SERIAL_LIVE_TIMEOUT)
         log_event("serial_open", status="ok", port=args.port, baud=args.baud)
 
         cap = open_camera(args.cam)
@@ -216,9 +280,9 @@ def run_live(args):
             base_options=BaseOptions(model_asset_path=args.model),
             running_mode=VisionRunningMode.VIDEO,
             num_hands=1,
-            min_hand_detection_confidence=0.6,
-            min_hand_presence_confidence=0.6,
-            min_tracking_confidence=0.6,
+            min_hand_detection_confidence=MP_MIN_HAND_DETECTION_CONF,
+            min_hand_presence_confidence=MP_MIN_HAND_PRESENCE_CONF,
+            min_tracking_confidence=MP_MIN_TRACKING_CONF,
         )
         log_event("mediapipe_init", model=args.model, num_hands=1)
 
@@ -308,6 +372,8 @@ def run_live(args):
         log_event("live_error", reason="runtime_exception", error=str(exc))
         print(f"Error in live mode: {exc}")
     finally:
+        for sig, handler in original_handlers.items():
+            signal.signal(sig, handler)
         if ser and ser.is_open:
             ser.close()
         if cap and cap.isOpened():
@@ -317,24 +383,23 @@ def run_live(args):
         if log_handle:
             log_handle.close()
 # ----------------- Calibrate mode -------------------
-HELP_TEXT = """
-Calibration keys (targeting ONE finger at a time):
-  j / l : -1 / +1 degree
-  J / L : -5 / +5 degrees
-  m     : mark current as MIN for this finger
-  n     : mark current as MAX for this finger
-  space : next finger
-  b     : back (previous finger)
-  r     : reset angle to 90
-  g     : send GET (print current limits from Arduino)
-  s     : SAVE all limits to EEPROM
-  q     : quit
-
-Tip: keep movements between comfortable mechanical limits (no buzzing).
-"""
+HELP_TEXT = (
+    "\nCalibration keys (targeting ONE finger at a time):\n"
+    "  j / l : -1 / +1 degree\n"
+    "  J / L : -5 / +5 degrees\n"
+    "  m     : mark current as MIN for this finger\n"
+    "  n     : mark current as MAX for this finger\n"
+    "  space : next finger\n"
+    "  b     : back (previous finger)\n"
+    f"  r     : reset angle to {CALIB_START_DEG}\n"
+    "  g     : send GET (print current limits from Arduino)\n"
+    "  s     : SAVE all limits to EEPROM\n"
+    "  q     : quit\n\n"
+    "Tip: keep movements between comfortable mechanical limits (no buzzing).\n"
+)
 
 # Clamp helper used throughout calibration to keep servo angles safe.
-def clamp(v, lo=0, hi=180): return max(lo, min(hi, v))
+def clamp(v, lo=CALIB_CLAMP_MIN, hi=CALIB_CLAMP_MAX): return max(lo, min(hi, v))
 
 # Serial-only calibration loop; lets the user mark servo min/max ranges.
 def run_calibrate(args):
@@ -359,15 +424,38 @@ def run_calibrate(args):
 
     # Serial only (no MediaPipe/camera needed)
     ser = None
-    deg = [90, 90, 90, 90, 90, 90]  # Current degrees we are commanding per finger
+    deg = [CALIB_START_DEG] * 6  # Current degrees we are commanding per finger
     mins = [None] * 6               # Collected MIN (open) angles per finger index
     maxs = [None] * 6               # Collected MAX (closed) angles per finger index
     finger = 0
 
+    env_snapshot = build_env_snapshot(args.port)
+    log_event("env_snapshot", **env_snapshot)
+
+    shutdown_requested = False
+    sent_neutral = False
+    original_handlers = {}
+
+    def handle_signal(signum, frame):
+        nonlocal shutdown_requested, sent_neutral
+        if shutdown_requested:
+            return
+        shutdown_requested = True
+        log_event("shutdown", signal=signum)
+        if ser and ser.is_open and not sent_neutral:
+            send_line(ser, "NEUTRAL\n", args.print_tx, log_event, "serial_send", {"reason": "shutdown"})
+            sent_neutral = True
+        cv.destroyAllWindows()
+        raise KeyboardInterrupt()
+
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        original_handlers[sig] = signal.getsignal(sig)
+        signal.signal(sig, handle_signal)
+
     try:
         log_event("calibrate_start", port=args.port, baud=args.baud)
         try:
-            ser = serial.Serial(args.port, args.baud, timeout=0.1)
+            ser = serial.Serial(args.port, args.baud, timeout=SERIAL_CAL_TIMEOUT)
         except Exception as exc:
             log_event("calibrate_error", reason="serial_open", error=str(exc))
             print(f"ERROR opening serial {args.port}: {exc}")
@@ -439,7 +527,7 @@ def run_calibrate(args):
                     log_event("calibrate_adjust", finger=finger, key='L', angle=int(deg[finger]))
                     send_degrees()
                 elif k == ord('r'):
-                    deg[finger] = 90
+                    deg[finger] = CALIB_START_DEG
                     log_event("calibrate_reset", finger=finger, angle=int(deg[finger]))
                     send_degrees()
                 elif k == ord('m'):
@@ -492,6 +580,10 @@ def run_calibrate(args):
             print()
             print("Stopping calibration...")
     finally:
+        for sig, handler in original_handlers.items():
+            signal.signal(sig, handler)
+        for sig, handler in original_handlers.items():
+            signal.signal(sig, handler)
         if ser and ser.is_open:
             ser.close()
         cv.destroyAllWindows()
