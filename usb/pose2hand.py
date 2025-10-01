@@ -23,6 +23,7 @@ import platform
 import signal
 import sys
 import time
+import collections
 
 # Third-party imports
 import cv2 as cv
@@ -39,6 +40,11 @@ SEND_HZ = 20                      # Desired serial update rate (Hz)
 SMOOTH_ALPHA = 0.6                # EMA smoothing factor for finger percentages
 MIRROR_PREVIEW = True             # Mirror preview only; math still uses original orientation
 PRINT_TX = True                   # Emit outbound serial lines to stdout
+EMA_ALPHA = 0.5                   # Default EMA alpha when --smooth not provided
+DEADBAND  = 2.0                   # percent points
+SLEW_MAX  = 8.0                   # max change per send (pp)
+QUANTIZE  = 1.0                   # snap to nearest 1% to reduce chatter
+# ---------------------------------------------------
 
 # Constants
 FLEXION_OPEN_THRESHOLD = -0.15    # Normalised TIP-MCP delta treated as fully open (0 %)
@@ -169,6 +175,50 @@ def flexion_percent(landmarks):
     pcts.append(SWIVEL_NEUTRAL_PERCENT)  # swivel neutral (adjust if you want wrist yaw mapping)
     return pcts
 
+
+# Per-channel conditioning pipeline (median → EMA → quantize → deadband → slew)
+class ChannelSmoother:
+    def __init__(self, alpha=EMA_ALPHA, channels=6):
+        self.alpha = float(alpha)
+        self.channels = channels
+        self.med_buffers = [collections.deque(maxlen=3) for _ in range(channels)]
+        self.ema = [50.0] * channels
+        self.last_sent = [50.0] * channels
+
+    def reset(self):
+        for buf in self.med_buffers:
+            buf.clear()
+        self.ema = [50.0] * self.channels
+        self.last_sent = [50.0] * self.channels
+
+    def process(self, values):
+        return [self._process_channel(i, v) for i, v in enumerate(values)]
+
+    def current(self):
+        return list(self.last_sent)
+
+    def _process_channel(self, i, val):
+        buf = self.med_buffers[i]
+        buf.append(val)
+        median = sorted(buf)[len(buf) // 2]
+
+        ema_prev = self.ema[i]
+        ema_val = self.alpha * median + (1.0 - self.alpha) * ema_prev
+        self.ema[i] = ema_val
+
+        if QUANTIZE:
+            quantized = round(ema_val / QUANTIZE) * QUANTIZE
+        else:
+            quantized = ema_val
+
+        last = self.last_sent[i]
+        if abs(quantized - last) < DEADBAND:
+            quantized = last
+
+        delta = max(-SLEW_MAX, min(SLEW_MAX, quantized - last))
+        out = max(0.0, min(100.0, last + delta))
+        self.last_sent[i] = out
+        return out
 # ---------------------- Serial ----------------------
 # Send a newline-terminated command to the Arduino and optionally log diagnostics.
 def send_line(ser, text, print_tx=PRINT_TX, log_fn=None, log_event_name="serial_write", log_data=None):
@@ -254,8 +304,12 @@ def run_live(args):
             model_size = None
         log_event("model_loaded", path=args.model, size=model_size)
 
+        smooth_alpha = min(max(args.smooth, 0.0), 1.0)
+        if smooth_alpha != args.smooth:
+            print(f"[WARN] --smooth value {args.smooth} clamped to {smooth_alpha} (expected 0.0-1.0 range)")
+
         log_event("live_start", port=args.port, baud=args.baud, cam=args.cam,
-                  send_hz=args.send_hz, smooth=args.smooth, mirror=MIRROR_PREVIEW)
+                  send_hz=args.send_hz, smooth=smooth_alpha, mirror=MIRROR_PREVIEW)
 
         ser = serial.Serial(args.port, args.baud, timeout=SERIAL_LIVE_TIMEOUT)
         log_event("serial_open", status="ok", port=args.port, baud=args.baud)
@@ -287,10 +341,12 @@ def run_live(args):
         log_event("mediapipe_init", model=args.model, num_hands=1)
 
         fpsm = FPSMeter()
-        smooth = [50] * 6
+        channel_filter = ChannelSmoother(alpha=smooth_alpha)
+        smooth = channel_filter.current()
         send_period = 1.0 / max(1, args.send_hz)
         last_send = 0.0
         t0 = time.time()
+        next_due = time.monotonic()
 
         with HandLandmarker.create_from_options(options) as landmarker:
             log_event("mediapipe_ready")
@@ -322,22 +378,34 @@ def run_live(args):
                     pcts = None
 
                 hand_present = pcts is not None
+                prev_present = bool(hand_present_prev)
+                if prev_present and not hand_present:
+                    if ser and ser.is_open:
+                        send_line(ser, "NEUTRAL\n", args.print_tx, log_event, "serial_send",
+                                  {"reason": "hand_lost", "frame": frame_index})
+                    channel_filter.reset()
+                    smooth = channel_filter.current()
+                elif not prev_present and hand_present:
+                    channel_filter.reset()
+                    smooth = channel_filter.current()
+
                 if hand_present != hand_present_prev:
                     log_event("hand_presence", present=hand_present, frame=frame_index)
                     hand_present_prev = hand_present
 
                 frame_vis = cv.flip(frame, 1) if MIRROR_PREVIEW else frame
-                now = time.time()
+                now = time.monotonic()
                 if pcts is not None:
                     if args.print_tx:
                         raw_vals = ", ".join(f"{v:.2f}" for v in pcts)
                         print(f"[RAW] {raw_vals}")
                     # Blend raw measurements to suppress jitter before converting to servo targets.
-                    smooth = ema_vec(smooth, pcts, args.smooth)
                     if (now - last_send) >= send_period:
+                        # Apply per-channel median, EMA, deadband, slew rate, and quantization.
+                        smooth = channel_filter.process(pcts)
                         # Percentages must be integers (0-100) for the Arduino firmware.
                         vals = [int(round(v)) for v in smooth]
-                        line = "P:{},{},{},{},{},{}\n".format(*vals)
+                        tx_line = "P:{},{},{},{},{},{}\n".format(*vals)
                         log_payload = {
                             "frame": frame_index,
                             "raw_percentages": [round(float(v), 4) for v in pcts],
@@ -348,8 +416,11 @@ def run_live(args):
                             "fps": fps,
                             "ts_ms": ts_ms,
                         }
-                        send_line(ser, line, args.print_tx, log_event, "serial_send", log_payload)
+                        send_line(ser, tx_line, args.print_tx, log_event, "serial_send", log_payload)
                         last_send = now
+                        # schedule next tick (catch up if late)
+                        missed = int((now - next_due)//send_period)
+                        next_due += send_period*(1+missed)
 
                 cv.putText(frame_vis, f"FPS {fps:4.1f}  TX {args.send_hz:02d}Hz",
                            (10,24), cv.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,255), 2)

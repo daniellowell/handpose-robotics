@@ -42,11 +42,8 @@ static const uint8_t invert[6] = {1,1,1,1,1,0};
 int angMin[6] = {60, 60, 60, 70, 60, 80};
 int angMax[6] = {120,120,120,110,120,100};
 
-// Smoothing factor: higher alpha = faster reaction, lower = smoother
-const float alpha = 0.7f;
-
 // Auto-detach after this many ms without new command
-const unsigned long idle_ms = 4000;
+const unsigned long idle_ms = 8000;
 
 // EEPROM constants
 const int EEPROM_MAGIC_ADDR = 0;   // address for "magic" byte
@@ -146,8 +143,8 @@ void applyAnglesDegrees(const int a[6]) {
   for (int i=0;i<6;i++) {
     int tgt = applyInvertClamp(i, a[i]);
     // Exponential Moving Average smoothing
-    ema[i] = alpha * (float)tgt + (1.0f - alpha) * ema[i];
-    s[i].write((int)(ema[i] + 0.5f));
+    ema[i] = (float)tgt;
+    s[i].write(tgt);
   }
 }
 
