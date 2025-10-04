@@ -408,15 +408,13 @@ def run_live(args):
         log_event("mediapipe_init", model=args.model, num_hands=1)
 
         fpsm = FPSMeter()
-        channel_filter = ChannelSmoother(alpha=smooth_alpha)
-        smooth = channel_filter.current()
+        smooth = [50] * 6
         send_period = 1.0 / max(1, args.send_hz)
         last_send = 0.0
         last_status_query = 0.0
         status_query_period = 2.0  # Query servo status every 2 seconds (only if logging enabled)
         status_logging_enabled = bool(args.log_json or log_handle)
         t0 = time.time()
-        next_due = time.monotonic()
 
         with HandLandmarker.create_from_options(options) as landmarker:
             log_event("mediapipe_ready")
@@ -453,23 +451,20 @@ def run_live(args):
                     if ser and ser.is_open:
                         send_line(ser, "NEUTRAL\n", args.print_tx, log_event, "serial_send",
                                   {"reason": "hand_lost", "frame": frame_index})
-                    channel_filter.reset()
-                    smooth = channel_filter.current()
+                    smooth = [50] * 6
                 elif not prev_present and hand_present:
-                    channel_filter.reset()
-                    smooth = channel_filter.current()
+                    smooth = [50] * 6
 
                 if hand_present != hand_present_prev:
                     log_event("hand_presence", present=hand_present, frame=frame_index)
                     hand_present_prev = hand_present
 
                 frame_vis = cv.flip(frame, 1) if MIRROR_PREVIEW else frame
-                now = time.monotonic()
+                now = time.time()
                 if pcts is not None:
                     # Blend raw measurements to suppress jitter before converting to servo targets.
+                    smooth = ema_vec(smooth, pcts, args.smooth)
                     if (now - last_send) >= send_period:
-                        # Apply per-channel median, EMA, deadband, slew rate, and quantization.
-                        smooth = channel_filter.process(pcts)
                         # Percentages must be integers (0-100) for the Arduino firmware.
                         vals = [int(round(v)) for v in smooth]
                         line = "P:{},{},{},{},{},{}\n".format(*vals)
