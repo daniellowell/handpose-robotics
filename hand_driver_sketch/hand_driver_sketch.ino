@@ -16,10 +16,12 @@
  *   1) Degrees:  "90,100,95,100,90,90"
  *   2) Percent:  "P:0,25,50,75,100,50"
  *      - Each % is mapped into that finger's [angMin..angMax]
- *   3) CAL i min max   -> sets calibration limits for servo i (0=thumb..5=swivel)
- *   4) SAVE            -> saves limits to EEPROM (persistent)
- *   5) GET             -> prints limits to serial monitor
- *   6) NEUTRAL         -> moves all to midpoint of min/max
+ *   3) Single:   "S:i,angle" (e.g., S:0,90) -> move only servo i, no smoothing
+ *   4) CAL i min max   -> sets calibration limits for servo i (0=thumb..5=swivel)
+ *   5) SAVE            -> saves limits to EEPROM (persistent)
+ *   6) GET             -> prints limits to serial monitor
+ *   7) NEUTRAL         -> moves all to midpoint of min/max
+ *   8) STATUS          -> prints current servo positions as JSON
  *
  * Safety:
  *   - Each servo is clamped to its angMin..angMax
@@ -36,17 +38,18 @@
 static const uint8_t SERVO_PINS[6] = {7, 6, 5, 4, 3, 2};
 
 // Invert any channel if needed (1 = invert motion, 0 = normal)
-static const uint8_t invert[6] = {1,1,1,1,1,0};
+static const uint8_t invert[6] = {0,1,1,1,1,0};
 
 // Safe angle ranges (per servo) — start conservative
-int angMin[6] = {60, 60, 60, 70, 60, 80};
-int angMax[6] = {120,120,120,110,120,100};
+int angMin[6] = {35, 35, 35, 35, 35, 80};
+int angMax[6] = {160,160,160,160,160,100};
 
 // Smoothing factor: higher alpha = faster reaction, lower = smoother
-const float alpha = 0.7f;
+// Increased from 0.7 since Python joint-angle detection now provides cleaner data
+const float alpha = 0.95f;
 
 // Auto-detach after this many ms without new command
-const unsigned long idle_ms = 4000;
+const unsigned long idle_ms = 2000;
 
 // EEPROM constants
 const int EEPROM_MAGIC_ADDR = 0;   // address for "magic" byte
@@ -140,6 +143,26 @@ void printLimits() {
   Serial.println();
 }
 
+// Print current servo positions as JSON
+void printStatus() {
+  Serial.print("{\"servos\":[");
+  for (int i=0;i<6;i++) {
+    Serial.print((int)(ema[i] + 0.5f));
+    if (i<5) Serial.print(',');
+  }
+  Serial.print("],\"limits\":{\"min\":[");
+  for (int i=0;i<6;i++) {
+    Serial.print(angMin[i]);
+    if (i<5) Serial.print(',');
+  }
+  Serial.print("],\"max\":[");
+  for (int i=0;i<6;i++) {
+    Serial.print(angMax[i]);
+    if (i<5) Serial.print(',');
+  }
+  Serial.println("]}}");
+}
+
 // Apply raw degree targets to all servos (with smoothing)
 void applyAnglesDegrees(const int a[6]) {
   attachIfNeeded();
@@ -192,7 +215,8 @@ void setup() {
   Serial.println("uHand Option A ready.");
 }
 
-static String line;
+static char line[64];
+static uint8_t line_pos = 0;
 
 void loop() {
   // Read serial line-by-line
@@ -201,17 +225,18 @@ void loop() {
     if (c == '\r') continue;
     if (c == '\n') {
       // process full line
-      line.trim();
-      if (line.length() > 0) {
+      line[line_pos] = '\0';  // null terminate
+      if (line_pos > 0) {
         last_cmd_ms = millis();
         // Handle different prefixes
-        if (line.startsWith("P:") || line.startsWith("p:")) {
+        if ((line[0]=='P' || line[0]=='p') && line[1]==':') {
           int pcts[6]={0,0,0,0,0,0};
-          int n=parseCSV6(line.c_str()+2,pcts);
+          int n=parseCSV6(line+2,pcts);
           if(n>=1) applyPercent(pcts);
-        } else if (line.startsWith("CAL ") || line.startsWith("cal ")) {
+        } else if ((line[0]=='C' || line[0]=='c') && (line[1]=='A' || line[1]=='a') &&
+                   (line[2]=='L' || line[2]=='l') && line[3]==' ') {
           int i,mn,mx;
-          if (sscanf(line.c_str()+4,"%d %d %d",&i,&mn,&mx)==3 && i>=0 && i<6) {
+          if (sscanf(line+4,"%d %d %d",&i,&mn,&mx)==3 && i>=0 && i<6) {
             angMin[i]=constrain(mn,0,180);
             angMax[i]=constrain(mx,0,180);
             if(angMin[i]>angMax[i]){int t=angMin[i];angMin[i]=angMax[i];angMax[i]=t;}
@@ -220,23 +245,34 @@ void loop() {
           } else {
             Serial.println("ERR CAL usage: CAL i min max");
           }
-        } else if (line.equalsIgnoreCase("SAVE")) {
+        } else if (strcasecmp(line, "SAVE") == 0) {
           saveLimitsToEEPROM();
-        } else if (line.equalsIgnoreCase("GET")) {
+        } else if (strcasecmp(line, "GET") == 0) {
           printLimits();
-        } else if (line.equalsIgnoreCase("NEUTRAL")) {
+        } else if (strcasecmp(line, "NEUTRAL") == 0) {
           goNeutral();
           Serial.println("OK NEUTRAL");
+        } else if (strcasecmp(line, "STATUS") == 0) {
+          printStatus();
+        } else if ((line[0]=='S' || line[0]=='s') && line[1]==':') {
+          // Single servo command: S:index,angle (e.g., S:0,90 moves thumb to 90 degrees)
+          int i, ang;
+          if (sscanf(line+2, "%d,%d", &i, &ang) == 2 && i >= 0 && i < 6) {
+            attachIfNeeded();
+            int tgt = applyInvertClamp(i, ang);
+            ema[i] = (float)tgt;  // Set directly, no smoothing for calibration precision
+            s[i].write(tgt);
+          }
         } else {
           // Default: treat as degrees
           int deg[6]={90,90,90,90,90,90};
-          int n=parseCSV6(line.c_str(),deg);
+          int n=parseCSV6(line,deg);
           if(n>=1) applyAnglesDegrees(deg);
         }
       }
-      line=""; // clear buffer
+      line_pos = 0; // clear buffer
     } else {
-      if (line.length()<96) line+=c;
+      if (line_pos < 63) line[line_pos++] = c;
     }
   }
 

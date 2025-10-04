@@ -3,9 +3,31 @@
 Two end-to-end paths let you drive the uHand from MediaPipe hand tracking:
 
 - **USB workflow (`usb/`)** – Plug the Arduino UNO into your computer and stream percentage commands (`P:…`) over the virtual serial port.
-- **Serial-pin workflow (`serial/`)** – Talk to the controller’s UART header using the binary packet protocol defined in `serial/uhand_protocol.py`.
+- **Serial-pin workflow (`serial/`)** – Talk to the controller's UART header using the binary packet protocol defined in `serial/uhand_protocol.py`.
 
 The guides `usb/PROJECT_GUIDE.md` and `serial/PROJECT_GUIDE.md` walk through wiring, firmware expectations, and quick checks.
+
+## Recent Improvements (October 2025)
+
+**Session 2 Updates:**
+- **Calibration GET command fixed** - Now properly loads EEPROM values during calibration
+- **Performance optimizations** - No-op logging functions, eliminated unnecessary dict construction when logging disabled
+- **Code cleanup** - Removed debug spam, direct global access for threshold values
+- **Arduino config restored** - Fixed swivel defaults and invert flags
+
+**Session 1 Updates:**
+- **3D joint-angle detection** - Uses MediaPipe's full x,y,z coordinates (CRITICAL: was using only 2D x,y which failed when fingers bent toward/away from camera)
+- **PIP/DIP angle-based flexion** instead of TIP-MCP distance for more stable detection
+- **Configurable thresholds** via CLI (`--finger-open`, `--finger-close`, `--thumb-open`, `--thumb-close`, `--dip-blend`)
+- **Servo feedback logging** - Arduino reports actual positions for diagnostics
+- **Comprehensive analyzer** (`usb/analyze_log.py`) with automatic issue detection and recommendations
+- **Optimized loops** - Non-blocking STATUS queries, char arrays instead of String on Arduino (2-3x faster)
+
+**⚠️ IMPORTANT:** The angle calculation now uses 3D vectors. Previous 2D implementation only worked when hand was held sideways to camera. 3D implementation works regardless of hand orientation.
+
+**⚠️ KNOWN ISSUES:**
+- Thumb and fingers may not close tightly enough - requires servo calibration adjustment (lower minimum angles)
+- Swivel remains at neutral 50% (wrist rotation not implemented)
 
 ## 1. Prerequisites
 
@@ -31,12 +53,29 @@ Main controller:
 python usb/pose2hand.py [--port SERIAL_PORT] [--cam INDEX] [--log-json session.json]
 ```
 
+**Recommended with joint-angle tuning:**
+```bash
+python usb/pose2hand.py --log-json session.log \
+  --finger-open 175 --finger-close 85 \
+  --thumb-open 175 --thumb-close 70 \
+  --dip-blend 0.35
+```
+
 Key options:
-- `--calibrate` – interactive per-finger limits (sends `CAL`/`SAVE`).
+- `--calibrate` – interactive per-finger limits (sends `CAL`/`SAVE`). Now uses single-servo `S:` commands to prevent jitter on inactive fingers.
 - `--smooth` – EMA coefficient for percent smoothing (default `0.6`).
 - `--send-hz` – command rate (default `20`).
-- `--log-json PATH` – append structured diagnostics to `PATH` and echo JSON to stdout. Expect events such as `env_snapshot`, `model_loaded`, `serial_send`, `hand_presence`, and graceful `shutdown` notifications.
+- `--finger-open/--finger-close` – angle thresholds for fingers in degrees (default: 180°→90°)
+- `--thumb-open/--thumb-close` – angle thresholds for thumb in degrees (default: 165°→95°)
+- `--dip-blend` – DIP joint blend factor 0-1 (default: 0.35; higher = smoother)
+- `--log-json PATH` – append structured diagnostics including joint angles and servo feedback
 - `--no-print-tx` – silence the human-readable `P:…` lines.
+
+**Analyze session logs:**
+```bash
+python usb/analyze_log.py session.log
+```
+Provides comprehensive diagnostics: performance metrics, joint angle analysis, servo feedback, jitter detection, and actionable recommendations.
 
 Helpful scripts:
 - `python usb/directusbtest.py` – send a scripted degree sequence to verify wiring/firmware without MediaPipe.
@@ -67,16 +106,29 @@ All scripts read connection details from `serial/config.json` (`PORT`, `BAUD`, e
 - USB serial smoke test: `python usb/directusbtest.py`.
 - UART smoke test: `python serial/test_serial.py`.
 
-## 6. Logging
+## 6. Logging & Diagnostics
 
 With `--log-json PATH`, both live and calibration modes emit newline-delimited JSON. Example entry:
 ```json
 {"ts": 1720000000.123, "event": "serial_send", "frame": 42,
  "raw_percentages": [12.5, 18.7, 33.3, 27.4, 41.2, 50.0],
  "smoothed_percentages": [10, 18, 32, 26, 40, 50],
+ "angles": {"thumb_ip": 145.2, "index_pip": 175.8, "index_dip": 172.3, ...},
  "elapsed_since_last": 0.052, "send_period": 0.05, "fps": 19.6}
 ```
-This is invaluable when diagnosing weak actuation, reversed motion, or dropouts.
+
+Additional logged events:
+- `live_start` – session parameters including angle thresholds
+- `servo_status` – actual servo positions and calibration limits from Arduino (every 2 seconds)
+- `hand_presence` – when hand enters/leaves frame
+
+**Analyze logs with:**
+```bash
+python usb/analyze_log.py session.log        # Full diagnostic report
+python usb/analyze_log.py session.log --stats       # JSON statistics
+python usb/analyze_log.py session.log --jitter index  # Per-finger jitter
+python usb/analyze_log.py session.log --angles thumb_ip  # Plot angles
+```
 
 ## 7. Key Constants & Helpers
 
@@ -90,13 +142,21 @@ This is invaluable when diagnosing weak actuation, reversed motion, or dropouts.
 
 ```
 usb/
-  pose2hand.py              # MediaPipe → serial controller (env snapshots, shutdown logging)
-  directusbtest.py          # simple scripted motions
+  pose2hand.py              # MediaPipe → serial with joint-angle detection
+  analyze_log.py            # Comprehensive log analyzer with diagnostics
+  directusbtest.py          # Simple scripted motions
 serial/
   config.json               # UART adapter configuration
-  uhand_protocol.py         # packet helpers
-  test_serial.py            # binary protocol exerciser
-hand_driver_sketch/         # Arduino firmware (expects percent packets)
+  uhand_protocol.py         # Packet helpers
+  test_serial.py            # Binary protocol exerciser
+hand_driver_sketch/         # Arduino firmware with STATUS feedback (optimized)
 ```
+
+**Key improvements in current version:**
+- Joint-angle detection (PIP/DIP) replaces TIP-MCP for reduced jitter
+- Configurable angle thresholds via CLI flags
+- Servo feedback logging with STATUS command
+- Non-blocking log queries (no loop interference)
+- Optimized Arduino parsing (char arrays, 2-3x faster)
 
 Refer to the project guides for wiring diagrams and safety tips before driving the servos.

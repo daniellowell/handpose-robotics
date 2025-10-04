@@ -36,13 +36,24 @@ MODEL_PATH = "hand_landmarker.task"  # MediaPipe model path
 CAM_INDEX = 0                     # Default camera index used by OpenCV
 USE_AVFOUNDATION = True           # Prefer macOS AVFoundation backend when present
 SEND_HZ = 20                      # Desired serial update rate (Hz)
-SMOOTH_ALPHA = 0.6                # EMA smoothing factor for finger percentages
+SMOOTH_ALPHA = 0.6               # EMA smoothing factor for finger percentages default (0-1, higher=more smoothing)
 MIRROR_PREVIEW = True             # Mirror preview only; math still uses original orientation
 PRINT_TX = True                   # Emit outbound serial lines to stdout
 
 # Constants
-FLEXION_OPEN_THRESHOLD = -0.15    # Normalised TIP-MCP delta treated as fully open (0 %)
-FLEXION_CLOSE_THRESHOLD = 0.30    # Normalised TIP-MCP delta treated as fully closed (100 %)
+FLEXION_OPEN_THRESHOLD = -0.15    # Normalised TIP-MCP delta treated as fully open (0 %) [deprecated, kept for reference]
+FLEXION_CLOSE_THRESHOLD = 0.30    # Normalised TIP-MCP delta treated as fully closed (100 %) [deprecated, kept for reference]
+
+# Joint-angle based flexion thresholds (set by CLI args, defaults here)
+FINGER_OPEN_DEG = 70.0           # Default open angle for fingers (PIP/DIP)
+FINGER_CLOSE_DEG = 100.0           # Default closed angle for fingers (PIP/DIP)
+THUMB_OPEN_DEG = 70.0            # Default open angle for thumb (IP)
+THUMB_CLOSE_DEG = 100.0           # Default closed angle for thumb (IP)
+DIP_BLEND = 0.30                  # Default DIP blend factor (0.35 = 35% DIP, 65% PIP) 
+
+# Global variable for storing joint angles for logging
+_last_joint_angles_for_log = {}
+
 ESC_KEY = 27                      # ESC keycode for OpenCV loop exit
 SPACE_KEY = 32                    # Spacebar keycode used to advance fingers during calibration
 MIN_NORM_THRESHOLD = 1e-6         # Lower guard for hand span calculation
@@ -82,6 +93,8 @@ except Exception:
 # MediaPipe landmark indices
 TIP =  [4, 8,12,16,20]   # thumb..pinky
 MCP =  [2, 5, 9,13,17]   # thumb CMC (2) works well; others MCPs
+PIP_IDX = [3, 6, 10, 14, 18]  # thumb IP (3) used as PIP-equivalent for thumb
+DIP_IDX = [3, 7, 11, 15, 19]  # thumb uses 3 again
 HAND_CONNECTIONS = [
     (0,1),(1,2),(2,3),(3,4),
     (0,5),(5,6),(6,7),(7,8),
@@ -145,29 +158,95 @@ def ema_vec(prev, new, alpha=0.6):
     prev = np.asarray(prev, float); new = np.asarray(new, float)
     return (alpha*new + (1.0-alpha)*prev).tolist()
 
+def _angle_at(a, b, c):
+    """Compute interior angle at b in degrees given three landmarks a-b-c (using 3D x,y,z)."""
+    vx1, vy1, vz1 = a.x - b.x, a.y - b.y, a.z - b.z
+    vx2, vy2, vz2 = c.x - b.x, c.y - b.y, c.z - b.z
+    n1 = math.sqrt(vx1*vx1 + vy1*vy1 + vz1*vz1)
+    n2 = math.sqrt(vx2*vx2 + vy2*vy2 + vz2*vz2)
+    if n1 < 1e-6 or n2 < 1e-6:
+        return 180.0
+    cosang = (vx1*vx2 + vy1*vy2 + vz1*vz2) / (n1*n2)
+    cosang = max(-1.0, min(1.0, cosang))
+    angle = math.degrees(math.acos(cosang))
+    # Sanity check: filter only impossible angles < 10° (likely detection glitches)
+    # Real finger flexion can reach 30-40° when fully closed
+    if angle < 10.0:
+        return 180.0  # Return open position as fallback for obvious glitches
+    return angle
 
-def flexion_percent(landmarks):
+def _angle_to_pct(theta, open_deg, close_deg):
+    """Map angle θ to 0..100% closed linearly."""
+    if open_deg == close_deg:
+        return 0.0
+    lo, hi = (open_deg, close_deg) if open_deg < close_deg else (close_deg, open_deg)
+    t = (theta - lo) / (hi - lo)
+    t = 0.0 if t < 0.0 else 1.0 if t > 1.0 else t
+    # If open<close, 0% at open, 100% at close; else invert
+    return t*100.0 if open_deg < close_deg else (1.0 - t)*100.0
+
+
+def flexion_percent(landmarks, enable_logging=False):
     """
-    Return [thumb,index,middle,ring,pinky,swivel] in 0..100 (% closed)
-    Heuristic: TIP below MCP => more closed. Normalize by hand size.
+    Returns [thumb,index,middle,ring,pinky,swivel] in 0..100 (% closed)
+    Uses joint angles (thumb IP; others PIP with DIP blend) for stability.
     """
-    wrist = landmarks[0]; mid_mcp = landmarks[9]
-    norm = math.hypot(mid_mcp.x - wrist.x, mid_mcp.y - wrist.y)
-    if norm < MIN_NORM_THRESHOLD:
-        norm = DEFAULT_NORM
+    global _last_joint_angles_for_log
 
-    pcts = []
-    for tip, mcp in zip(TIP, MCP):
-        dy = landmarks[tip].y - landmarks[mcp].y  # + if tip lower than knuckle
-        raw = dy / norm
-        # Tune these for your camera angle / feel
-        OPEN_AT, CLOSE_AT = FLEXION_OPEN_THRESHOLD, FLEXION_CLOSE_THRESHOLD
-        pct = (raw - OPEN_AT) / (CLOSE_AT - OPEN_AT) * 100.0
-        pct = max(0.0, min(100.0, pct))
-        pcts.append(pct)
+    out = []
+    angles_log = {} if enable_logging else None
 
-    pcts.append(SWIVEL_NEUTRAL_PERCENT)  # swivel neutral (adjust if you want wrist yaw mapping)
-    return pcts
+    # Thumb (IP angle at index 3 formed by (2-3-4))
+    try:
+        th_ip = _angle_at(landmarks[2], landmarks[3], landmarks[4])
+        if not math.isfinite(th_ip):
+            th_ip = 180.0
+        th_pct = _angle_to_pct(th_ip, THUMB_OPEN_DEG, THUMB_CLOSE_DEG)
+        out.append(th_pct)
+        if angles_log is not None:
+            angles_log["thumb_ip"] = round(float(th_ip), 1)
+    except Exception:
+        out.append(50.0)  # fallback
+        if angles_log is not None:
+            angles_log["thumb_ip"] = None
+
+    # Index..Pinky
+    specs = [
+        (5,6,7,8),     # index
+        (9,10,11,12),  # middle
+        (13,14,15,16), # ring
+        (17,18,19,20), # pinky
+    ]
+    finger_names_short = ["index", "middle", "ring", "pinky"]
+    for idx, (mcp_i, pip_i, dip_i, tip_i) in enumerate(specs):
+        try:
+            pip_theta = _angle_at(landmarks[mcp_i], landmarks[pip_i], landmarks[dip_i])
+            dip_theta = _angle_at(landmarks[pip_i], landmarks[dip_i], landmarks[tip_i])
+            if not math.isfinite(pip_theta):
+                pip_theta = 180.0
+            if not math.isfinite(dip_theta):
+                dip_theta = 180.0
+            pip_pct   = _angle_to_pct(pip_theta, FINGER_OPEN_DEG, FINGER_CLOSE_DEG)
+            dip_pct   = _angle_to_pct(dip_theta, FINGER_OPEN_DEG, FINGER_CLOSE_DEG)
+            pct = (1.0 - DIP_BLEND) * pip_pct + DIP_BLEND * dip_pct
+            out.append(pct)
+            if angles_log is not None:
+                angles_log[f"{finger_names_short[idx]}_pip"] = round(float(pip_theta), 1)
+                angles_log[f"{finger_names_short[idx]}_dip"] = round(float(dip_theta), 1)
+        except Exception:
+            out.append(50.0)  # fallback
+            if angles_log is not None:
+                angles_log[f"{finger_names_short[idx]}_pip"] = None
+                angles_log[f"{finger_names_short[idx]}_dip"] = None
+
+    # Swivel remains neutral for now
+    out.append(SWIVEL_NEUTRAL_PERCENT)
+
+    # Store angle diagnostics for logging (only if logging enabled)
+    if angles_log is not None:
+        _last_joint_angles_for_log = angles_log
+
+    return out
 
 # ---------------------- Serial ----------------------
 # Send a newline-terminated command to the Arduino and optionally log diagnostics.
@@ -186,6 +265,32 @@ def send_line(ser, text, print_tx=PRINT_TX, log_fn=None, log_event_name="serial_
             log_fn("serial_write_error", line=text.strip(), error=str(e))
         print(f"[WARN] serial write failed: {e}")
 
+def read_arduino_status(ser):
+    """Non-blocking read of Arduino STATUS response. Returns servo angles dict or None."""
+    try:
+        # Check if data is available without blocking
+        if ser.in_waiting:
+            line = ser.readline().decode('utf-8', errors='ignore').strip()
+            if line.startswith('{') and 'servos' in line:
+                try:
+                    data = json.loads(line)
+                    return {
+                        'servo_angles': data.get('servos', []),
+                        'servo_limits': data.get('limits', {})
+                    }
+                except json.JSONDecodeError:
+                    pass
+        return None
+    except Exception:
+        return None
+
+def request_arduino_status(ser):
+    """Non-blocking request for STATUS from Arduino."""
+    try:
+        ser.write(b"STATUS\n")
+    except Exception:
+        pass
+
 # -------------------- Live mode ---------------------
 # Capture MediaPipe landmarks, map them to servo percentages, and stream packets.
 def run_live(args):
@@ -197,16 +302,19 @@ def run_live(args):
             print(f"[WARN] could not open log file {args.log_json}: {exc}")
             log_handle = None
 
-    def log_event(event, **data):
-        if not args.log_json and log_handle is None:
-            return
-        entry = {"ts": time.time(), "event": event}
-        entry.update(data)
-        if log_handle:
-            log_handle.write(json.dumps(entry) + "\n")
-            log_handle.flush()
-        if args.log_json:
-            print(json.dumps(entry))
+    # Optimize logging: use no-op function when logging is disabled
+    if args.log_json or log_handle:
+        def log_event(event, **data):
+            entry = {"ts": time.time(), "event": event}
+            entry.update(data)
+            if log_handle:
+                log_handle.write(json.dumps(entry) + "\n")
+                log_handle.flush()
+            if args.log_json:
+                print(json.dumps(entry))
+    else:
+        def log_event(event, **data):
+            pass  # No-op when logging disabled
 
     ser = None
     cap = None
@@ -255,7 +363,10 @@ def run_live(args):
         log_event("model_loaded", path=args.model, size=model_size)
 
         log_event("live_start", port=args.port, baud=args.baud, cam=args.cam,
-                  send_hz=args.send_hz, smooth=args.smooth, mirror=MIRROR_PREVIEW)
+                  send_hz=args.send_hz, smooth=args.smooth, mirror=MIRROR_PREVIEW,
+                  finger_open_deg=FINGER_OPEN_DEG, finger_close_deg=FINGER_CLOSE_DEG,
+                  thumb_open_deg=THUMB_OPEN_DEG, thumb_close_deg=THUMB_CLOSE_DEG,
+                  dip_blend=DIP_BLEND)
 
         ser = serial.Serial(args.port, args.baud, timeout=SERIAL_LIVE_TIMEOUT)
         log_event("serial_open", status="ok", port=args.port, baud=args.baud)
@@ -290,6 +401,9 @@ def run_live(args):
         smooth = [50] * 6
         send_period = 1.0 / max(1, args.send_hz)
         last_send = 0.0
+        last_status_query = 0.0
+        status_query_period = 2.0  # Query servo status every 2 seconds (only if logging enabled)
+        status_logging_enabled = bool(args.log_json or log_handle)
         t0 = time.time()
 
         with HandLandmarker.create_from_options(options) as landmarker:
@@ -314,7 +428,7 @@ def run_live(args):
                     if result and result.hand_landmarks:
                         lm = result.hand_landmarks[0]
                         # Convert landmark geometry into 0-100 % flexion values per finger.
-                        pcts = flexion_percent(lm)
+                        pcts = flexion_percent(lm, enable_logging=status_logging_enabled)
                         draw_hand_overlay(frame, lm)
                 except Exception as exc:
                     log_event("mediapipe_error", error=str(exc))
@@ -329,27 +443,44 @@ def run_live(args):
                 frame_vis = cv.flip(frame, 1) if MIRROR_PREVIEW else frame
                 now = time.time()
                 if pcts is not None:
-                    if args.print_tx:
-                        raw_vals = ", ".join(f"{v:.2f}" for v in pcts)
-                        print(f"[RAW] {raw_vals}")
                     # Blend raw measurements to suppress jitter before converting to servo targets.
                     smooth = ema_vec(smooth, pcts, args.smooth)
                     if (now - last_send) >= send_period:
                         # Percentages must be integers (0-100) for the Arduino firmware.
                         vals = [int(round(v)) for v in smooth]
                         line = "P:{},{},{},{},{},{}\n".format(*vals)
-                        log_payload = {
-                            "frame": frame_index,
-                            "raw_percentages": [round(float(v), 4) for v in pcts],
-                            "smoothed_percentages": vals,
-                            "elapsed_since_last": now - last_send,
-                            "send_period": send_period,
-                            "hand_present": True,
-                            "fps": fps,
-                            "ts_ms": ts_ms,
-                        }
+
+                        # Only build log payload if logging is enabled (avoid dict construction overhead)
+                        if status_logging_enabled:
+                            log_payload = {
+                                "frame": frame_index,
+                                "raw_percentages": [round(float(v), 4) for v in pcts],
+                                "smoothed_percentages": vals,
+                                "elapsed_since_last": now - last_send,
+                                "send_period": send_period,
+                                "hand_present": True,
+                                "fps": fps,
+                                "ts_ms": ts_ms,
+                            }
+                            # Add joint angle diagnostics if available
+                            if _last_joint_angles_for_log:
+                                log_payload["angles"] = _last_joint_angles_for_log
+                        else:
+                            log_payload = None
+
                         send_line(ser, line, args.print_tx, log_event, "serial_send", log_payload)
                         last_send = now
+
+                # Periodically query servo status from Arduino (only if logging enabled)
+                if status_logging_enabled and (now - last_status_query) >= status_query_period:
+                    request_arduino_status(ser)
+                    last_status_query = now
+
+                # Check for and log any pending STATUS responses (non-blocking)
+                if status_logging_enabled:
+                    status = read_arduino_status(ser)
+                    if status:
+                        log_event("servo_status", **status)
 
                 cv.putText(frame_vis, f"FPS {fps:4.1f}  TX {args.send_hz:02d}Hz",
                            (10,24), cv.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,255), 2)
@@ -488,14 +619,10 @@ def run_calibrate(args):
             cv.imshow("uHand Calibrate", img)
 
         def send_degrees(event_name="calibrate_apply_degrees"):
-            angles = [int(x) for x in deg]
-            line = "{},{},{},{},{},{}\n".format(*angles)
+            # Use single-servo command to avoid jitter on inactive fingers
+            line = "S:{},{}\n".format(finger, int(deg[finger]))
             send_line(ser, line, args.print_tx, log_event, event_name,
-                      {"finger": finger, "angles": angles})
-            # Repeat sends (without spamming logs) so firmware EMA settles
-            for _ in range(CAL_SETTLE_REPEATS):
-                time.sleep(SERIAL_COMMAND_DELAY)
-                send_line(ser, line, False)
+                      {"finger": finger, "angle": int(deg[finger])})
 
         # move only the current finger, keep others at their last set deg
         send_degrees("calibrate_initial")
@@ -546,6 +673,29 @@ def run_calibrate(args):
                     log_event("calibrate_get", finger=finger)
                     send_line(ser, "GET\n", args.print_tx, log_event, "calibrate_get_command",
                               {"finger": finger})
+                    # Read the response from Arduino
+                    time.sleep(0.2)  # Give Arduino time to respond
+                    try:
+                        # Read "LIMITS thumb,index,middle,ring,pinky,swivel:"
+                        ser.readline()
+                        # Read "MIN: x,x,x,x,x,x"
+                        min_line = ser.readline().decode('utf-8', errors='ignore').strip()
+                        # Read "MAX: x,x,x,x,x,x"
+                        max_line = ser.readline().decode('utf-8', errors='ignore').strip()
+
+                        if min_line.startswith("MIN:"):
+                            min_vals = [int(v.strip()) for v in min_line.split(":")[1].split(",")]
+                            for i in range(6):
+                                mins[i] = min_vals[i]
+                        if max_line.startswith("MAX:"):
+                            max_vals = [int(v.strip()) for v in max_line.split(":")[1].split(",")]
+                            for i in range(6):
+                                maxs[i] = max_vals[i]
+                        print(f"Loaded from EEPROM - MIN: {mins}, MAX: {maxs}")
+                        log_event("calibrate_get_response", mins=mins, maxs=maxs)
+                    except Exception as e:
+                        print(f"Failed to read EEPROM values: {e}")
+                        log_event("calibrate_get_error", error=str(e))
                 elif k == ord('s'):
                     ranges = []
                     for i in range(6):
@@ -595,6 +745,8 @@ def run_calibrate(args):
 
 # -------------------- CLI entry ---------------------
 def main():
+    global FINGER_OPEN_DEG, FINGER_CLOSE_DEG, THUMB_OPEN_DEG, THUMB_CLOSE_DEG, DIP_BLEND
+
     p = argparse.ArgumentParser(description="uHand controller")
     p.add_argument("--port", default=PORT)
     p.add_argument("--baud", type=int, default=BAUD)
@@ -609,7 +761,27 @@ def main():
     p.add_argument("--calibrate", action="store_true",
                    help="interactive per-finger min/max setup (no camera)")
 
+    # Joint-angle threshold flags
+    p.add_argument("--finger-open", type=float, default=180.0,
+                   help="open angle for fingers in degrees (default: 180.0)")
+    p.add_argument("--finger-close", type=float, default=90.0,
+                   help="closed angle for fingers in degrees (default: 90.0)")
+    p.add_argument("--thumb-open", type=float, default=165.0,
+                   help="open angle for thumb in degrees (default: 165.0)")
+    p.add_argument("--thumb-close", type=float, default=95.0,
+                   help="closed angle for thumb in degrees (default: 95.0)")
+    p.add_argument("--dip-blend", type=float, default=0.35,
+                   help="DIP blend factor, 0-1 (default: 0.35)")
+
     args = p.parse_args()
+
+    # Store threshold values in module-level constants
+    FINGER_OPEN_DEG  = args.finger_open
+    FINGER_CLOSE_DEG = args.finger_close
+    THUMB_OPEN_DEG   = args.thumb_open
+    THUMB_CLOSE_DEG  = args.thumb_close
+    DIP_BLEND        = args.dip_blend
+
     if args.calibrate:
         run_calibrate(args)
     else:
