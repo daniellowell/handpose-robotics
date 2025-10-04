@@ -23,6 +23,7 @@ import platform
 import signal
 import sys
 import time
+import collections
 
 # Third-party imports
 import cv2 as cv
@@ -39,6 +40,11 @@ SEND_HZ = 20                      # Desired serial update rate (Hz)
 SMOOTH_ALPHA = 0.6               # EMA smoothing factor for finger percentages default (0-1, higher=more smoothing)
 MIRROR_PREVIEW = True             # Mirror preview only; math still uses original orientation
 PRINT_TX = True                   # Emit outbound serial lines to stdout
+EMA_ALPHA = 0.5                   # Default EMA alpha when --smooth not provided
+DEADBAND  = 2.0                   # percent points
+SLEW_MAX  = 8.0                   # max change per send (pp)
+QUANTIZE  = 1.0                   # snap to nearest 1% to reduce chatter
+# ---------------------------------------------------
 
 # Constants
 FLEXION_OPEN_THRESHOLD = -0.15    # Normalised TIP-MCP delta treated as fully open (0 %) [deprecated, kept for reference]
@@ -362,6 +368,10 @@ def run_live(args):
             model_size = None
         log_event("model_loaded", path=args.model, size=model_size)
 
+        smooth_alpha = min(max(args.smooth, 0.0), 1.0)
+        if smooth_alpha != args.smooth:
+            print(f"[WARN] --smooth value {args.smooth} clamped to {smooth_alpha} (expected 0.0-1.0 range)")
+
         log_event("live_start", port=args.port, baud=args.baud, cam=args.cam,
                   send_hz=args.send_hz, smooth=args.smooth, mirror=MIRROR_PREVIEW,
                   finger_open_deg=FINGER_OPEN_DEG, finger_close_deg=FINGER_CLOSE_DEG,
@@ -398,13 +408,15 @@ def run_live(args):
         log_event("mediapipe_init", model=args.model, num_hands=1)
 
         fpsm = FPSMeter()
-        smooth = [50] * 6
+        channel_filter = ChannelSmoother(alpha=smooth_alpha)
+        smooth = channel_filter.current()
         send_period = 1.0 / max(1, args.send_hz)
         last_send = 0.0
         last_status_query = 0.0
         status_query_period = 2.0  # Query servo status every 2 seconds (only if logging enabled)
         status_logging_enabled = bool(args.log_json or log_handle)
         t0 = time.time()
+        next_due = time.monotonic()
 
         with HandLandmarker.create_from_options(options) as landmarker:
             log_event("mediapipe_ready")
@@ -436,16 +448,28 @@ def run_live(args):
                     pcts = None
 
                 hand_present = pcts is not None
+                prev_present = bool(hand_present_prev)
+                if prev_present and not hand_present:
+                    if ser and ser.is_open:
+                        send_line(ser, "NEUTRAL\n", args.print_tx, log_event, "serial_send",
+                                  {"reason": "hand_lost", "frame": frame_index})
+                    channel_filter.reset()
+                    smooth = channel_filter.current()
+                elif not prev_present and hand_present:
+                    channel_filter.reset()
+                    smooth = channel_filter.current()
+
                 if hand_present != hand_present_prev:
                     log_event("hand_presence", present=hand_present, frame=frame_index)
                     hand_present_prev = hand_present
 
                 frame_vis = cv.flip(frame, 1) if MIRROR_PREVIEW else frame
-                now = time.time()
+                now = time.monotonic()
                 if pcts is not None:
                     # Blend raw measurements to suppress jitter before converting to servo targets.
-                    smooth = ema_vec(smooth, pcts, args.smooth)
                     if (now - last_send) >= send_period:
+                        # Apply per-channel median, EMA, deadband, slew rate, and quantization.
+                        smooth = channel_filter.process(pcts)
                         # Percentages must be integers (0-100) for the Arduino firmware.
                         vals = [int(round(v)) for v in smooth]
                         line = "P:{},{},{},{},{},{}\n".format(*vals)

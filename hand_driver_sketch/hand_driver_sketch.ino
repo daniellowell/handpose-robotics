@@ -169,8 +169,8 @@ void applyAnglesDegrees(const int a[6]) {
   for (int i=0;i<6;i++) {
     int tgt = applyInvertClamp(i, a[i]);
     // Exponential Moving Average smoothing
-    ema[i] = alpha * (float)tgt + (1.0f - alpha) * ema[i];
-    s[i].write((int)(ema[i] + 0.5f));
+    ema[i] = (float)tgt;
+    s[i].write(tgt);
   }
 }
 
