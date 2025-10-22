@@ -38,7 +38,7 @@
 static const uint8_t SERVO_PINS[6] = {7, 6, 5, 4, 3, 2};
 
 // Invert any channel if needed (1 = invert motion, 0 = normal)
-static const uint8_t invert[6] = {0,1,1,1,1,0};
+static const uint8_t invert[6] = {0,0,1,1,1,0};
 
 // Safe angle ranges (per servo) — start conservative
 int angMin[6] = {35, 35, 35, 35, 35, 80};
@@ -169,8 +169,8 @@ void applyAnglesDegrees(const int a[6]) {
   for (int i=0;i<6;i++) {
     int tgt = applyInvertClamp(i, a[i]);
     // Exponential Moving Average smoothing
-    ema[i] = (float)tgt;
-    s[i].write(tgt);
+    ema[i] = alpha * (float)tgt + (1.0f - alpha) * ema[i];
+    s[i].write((int)(ema[i] + 0.5f));
   }
 }
 

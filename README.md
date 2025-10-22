@@ -9,6 +9,15 @@ The guides `usb/PROJECT_GUIDE.md` and `serial/PROJECT_GUIDE.md` walk through wir
 
 ## Recent Improvements (October 2025)
 
+**Session 3 Updates (Latest):**
+- **Fixed angle threshold defaults** - Restored correct values (180°→90° for fingers, 165°→95° for thumb) that were accidentally changed
+- **Fixed Arduino EMA smoothing** - Re-enabled proper exponential moving average that was disabled, eliminating jerky motion
+- **Fixed Python smoothing** - Changed from 0.3 to 0.6 alpha for faster, more responsive tracking
+- **Fixed send rate** - Reduced from 100Hz to 20Hz to prevent serial buffer overflow
+- **Calibration drift prevention** - Added automatic keep-alive mechanism that prevents servos from detaching during calibration, solving position drift issues
+- **Improved GET command** - Better serial buffer handling and error messages when reading EEPROM calibration
+- **Diagnostic tools added** - Created test scripts for power, servo response, real-time tracking, and individual servo testing
+
 **Session 2 Updates:**
 - **Calibration GET command fixed** - Now properly loads EEPROM values during calibration
 - **Performance optimizations** - No-op logging functions, eliminated unnecessary dict construction when logging disabled
@@ -23,11 +32,14 @@ The guides `usb/PROJECT_GUIDE.md` and `serial/PROJECT_GUIDE.md` walk through wir
 - **Comprehensive analyzer** (`usb/analyze_log.py`) with automatic issue detection and recommendations
 - **Optimized loops** - Non-blocking STATUS queries, char arrays instead of String on Arduino (2-3x faster)
 
-**⚠️ IMPORTANT:** The angle calculation now uses 3D vectors. Previous 2D implementation only worked when hand was held sideways to camera. 3D implementation works regardless of hand orientation.
+**⚠️ IMPORTANT:**
+- The angle calculation uses 3D vectors and works regardless of hand orientation
+- For inverted servos (Middle, Ring, Pinky), calibration must have MIN > MAX in EEPROM
+- Arduino auto-detaches servos after 2 seconds of no commands (saves power, prevents buzzing)
 
 **⚠️ KNOWN ISSUES:**
-- Thumb and fingers may not close tightly enough - requires servo calibration adjustment (lower minimum angles)
-- Swivel remains at neutral 50% (wrist rotation not implemented)
+- Some Arduino pins (D6, D7) may not respond - check wiring or remap pins if needed
+- Swivel remains at neutral 50% (wrist rotation not implemented yet)
 
 ## 1. Prerequisites
 
@@ -158,5 +170,80 @@ hand_driver_sketch/         # Arduino firmware with STATUS feedback (optimized)
 - Servo feedback logging with STATUS command
 - Non-blocking log queries (no loop interference)
 - Optimized Arduino parsing (char arrays, 2-3x faster)
+- Calibration keep-alive prevents servo drift
+
+## 9. Troubleshooting
+
+### Servos Not Moving
+
+**Run diagnostic tests in order:**
+
+1. **Basic connection test:**
+   ```bash
+   python usb/test_basic_connection.py
+   ```
+   Checks if Arduino is responding to serial commands.
+
+2. **Direct servo test:**
+   ```bash
+   python usb/test_arduino_direct.py
+   ```
+   Bypasses Python angle detection, sends simple P: commands.
+
+3. **Individual servo test:**
+   ```bash
+   python usb/test_each_servo.py
+   ```
+   Interactive control of each servo separately (use keys 0-5, o/c/m).
+
+4. **Real-time tracking test:**
+   ```bash
+   python usb/test_realtime.py
+   ```
+   Shows detected angles and sent commands in real-time.
+
+### Common Issues
+
+**Fingers moving erratically or slowly:**
+- Check Python smoothing (`--smooth 0.6` is default)
+- Check send rate (`--send-hz 20` is default)
+- Check Arduino EMA smoothing (alpha should be 0.95 in firmware)
+- Verify angle thresholds are correct (180°→90° for fingers, 165°→95° for thumb)
+
+**Fingers stuck or barely moving:**
+- Check EEPROM calibration ranges (should be 90°+ range for most servos)
+- For inverted servos (Middle/Ring/Pinky), MIN must be > MAX in EEPROM
+- Run `reset_calibration.py` to clear bad EEPROM data
+- Recalibrate with `python usb/pose2hand.py --calibrate`
+
+**Calibration positions drift between calibrate and live mode:**
+- Servos auto-detach after 2s of no commands and can drift
+- Latest version has automatic keep-alive to prevent this
+- Make sure you're using updated pose2hand.py
+
+**Specific servos don't respond:**
+- Check wiring - servos must be on correct pins (D2-D7)
+- Test Arduino pins with `test_each_servo.py`
+- Some pins may be damaged - remap in Arduino code if needed
+- Check servo power supply (6 servos need 2A+ at 5V)
+
+**Power issues (multiple servos slow):**
+- USB typically provides 0.5-0.9A, insufficient for 6 servos
+- Use external 5V 2A+ power supply for servo power rail
+- Connect GND between power supply and Arduino
+- Use powered USB hub, or try different USB port
+
+### Diagnostic Tools
+
+All diagnostic tools are in `usb/` directory:
+
+- `test_basic_connection.py` - Verify Arduino communication
+- `test_arduino_direct.py` - Test servos with simple commands
+- `test_each_servo.py` - Interactive individual servo control
+- `test_realtime.py` - Real-time angle detection display
+- `test_power.py` - Test if power is limiting servo speed
+- `diagnose_slow.py` - Analyze calibration ranges and response
+- `diagnose_pinky.py` - Specific pinky servo drift diagnostic
+- `reset_calibration.py` - Reset EEPROM to safe defaults
 
 Refer to the project guides for wiring diagrams and safety tips before driving the servos.

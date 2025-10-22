@@ -37,13 +37,9 @@ MODEL_PATH = "hand_landmarker.task"  # MediaPipe model path
 CAM_INDEX = 0                     # Default camera index used by OpenCV
 USE_AVFOUNDATION = True           # Prefer macOS AVFoundation backend when present
 SEND_HZ = 20                      # Desired serial update rate (Hz)
-SMOOTH_ALPHA = 0.6               # EMA smoothing factor for finger percentages default (0-1, higher=more smoothing)
+SMOOTH_ALPHA = 0.6                # EMA smoothing factor for finger percentages default (0-1, higher=more smoothing)
 MIRROR_PREVIEW = True             # Mirror preview only; math still uses original orientation
 PRINT_TX = True                   # Emit outbound serial lines to stdout
-EMA_ALPHA = 0.5                   # Default EMA alpha when --smooth not provided
-DEADBAND  = 2.0                   # percent points
-SLEW_MAX  = 8.0                   # max change per send (pp)
-QUANTIZE  = 1.0                   # snap to nearest 1% to reduce chatter
 # ---------------------------------------------------
 
 # Constants
@@ -51,11 +47,11 @@ FLEXION_OPEN_THRESHOLD = -0.15    # Normalised TIP-MCP delta treated as fully op
 FLEXION_CLOSE_THRESHOLD = 0.30    # Normalised TIP-MCP delta treated as fully closed (100 %) [deprecated, kept for reference]
 
 # Joint-angle based flexion thresholds (set by CLI args, defaults here)
-FINGER_OPEN_DEG = 70.0           # Default open angle for fingers (PIP/DIP)
-FINGER_CLOSE_DEG = 100.0           # Default closed angle for fingers (PIP/DIP)
-THUMB_OPEN_DEG = 70.0            # Default open angle for thumb (IP)
-THUMB_CLOSE_DEG = 100.0           # Default closed angle for thumb (IP)
-DIP_BLEND = 0.30                  # Default DIP blend factor (0.35 = 35% DIP, 65% PIP) 
+FINGER_OPEN_DEG = 180.0           # Default open angle for fingers (PIP/DIP)
+FINGER_CLOSE_DEG = 90.0           # Default closed angle for fingers (PIP/DIP)
+THUMB_OPEN_DEG = 165.0            # Default open angle for thumb (IP)
+THUMB_CLOSE_DEG = 95.0            # Default closed angle for thumb (IP)
+DIP_BLEND = 0.35                  # Default DIP blend factor (0.35 = 35% DIP, 65% PIP) 
 
 # Global variable for storing joint angles for logging
 _last_joint_angles_for_log = {}
@@ -647,9 +643,22 @@ def run_calibrate(args):
         send_degrees("calibrate_initial")
         update_status()
 
+        # Track time for keep-alive commands (prevent servo auto-detach)
+        last_command_time = time.time()
+        keepalive_interval = 1.5  # Send keep-alive every 1.5s (idle_ms is 2s)
+
         try:
             while True:
-                k = cv.waitKey(0) & 0xFF  # Mask to handle cross-platform key codes
+                # Use non-blocking waitKey with 100ms timeout
+                k = cv.waitKey(100) & 0xFF  # Check for key every 100ms
+
+                # Send keep-alive ONLY if no user command in last 1.5s
+                now = time.time()
+                if (now - last_command_time) >= keepalive_interval:
+                    # Re-send current position to keep servos alive
+                    send_degrees("calibrate_keepalive")
+                    last_command_time = now  # Reset timer
+
                 if k == 255:
                     continue
 
@@ -660,22 +669,27 @@ def run_calibrate(args):
                     deg[finger] = clamp(deg[finger] - 1)
                     log_event("calibrate_adjust", finger=finger, key='j', angle=int(deg[finger]))
                     send_degrees()
+                    last_command_time = time.time()  # Reset keep-alive timer
                 elif k == ord('l'):
                     deg[finger] = clamp(deg[finger] + 1)
                     log_event("calibrate_adjust", finger=finger, key='l', angle=int(deg[finger]))
                     send_degrees()
+                    last_command_time = time.time()  # Reset keep-alive timer
                 elif k == ord('J'):
                     deg[finger] = clamp(deg[finger] - 5)
                     log_event("calibrate_adjust", finger=finger, key='J', angle=int(deg[finger]))
                     send_degrees()
+                    last_command_time = time.time()  # Reset keep-alive timer
                 elif k == ord('L'):
                     deg[finger] = clamp(deg[finger] + 5)
                     log_event("calibrate_adjust", finger=finger, key='L', angle=int(deg[finger]))
                     send_degrees()
+                    last_command_time = time.time()  # Reset keep-alive timer
                 elif k == ord('r'):
                     deg[finger] = CALIB_START_DEG
                     log_event("calibrate_reset", finger=finger, angle=int(deg[finger]))
                     send_degrees()
+                    last_command_time = time.time()  # Reset keep-alive timer
                 elif k == ord('m'):
                     mins[finger] = int(deg[finger])
                     log_event("calibrate_mark_min", finger=finger, angle=mins[finger])
@@ -690,30 +704,43 @@ def run_calibrate(args):
                         print("  (MAX currently below MIN; values will be sorted when saving)")
                 elif k == ord('g'):
                     log_event("calibrate_get", finger=finger)
+                    # Clear any pending data in serial buffer first
+                    ser.reset_input_buffer()
                     send_line(ser, "GET\n", args.print_tx, log_event, "calibrate_get_command",
                               {"finger": finger})
                     # Read the response from Arduino
-                    time.sleep(0.2)  # Give Arduino time to respond
+                    time.sleep(0.3)  # Give Arduino time to respond
                     try:
-                        # Read "LIMITS thumb,index,middle,ring,pinky,swivel:"
-                        ser.readline()
-                        # Read "MIN: x,x,x,x,x,x"
-                        min_line = ser.readline().decode('utf-8', errors='ignore').strip()
-                        # Read "MAX: x,x,x,x,x,x"
-                        max_line = ser.readline().decode('utf-8', errors='ignore').strip()
+                        # Read all three lines from Arduino
+                        lines = []
+                        for _ in range(3):
+                            line = ser.readline().decode('utf-8', errors='ignore').strip()
+                            lines.append(line)
+                            if args.print_tx:
+                                print(f"  Arduino: {line}")
 
-                        if min_line.startswith("MIN:"):
+                        # Parse the MIN and MAX lines
+                        min_line = None
+                        max_line = None
+                        for line in lines:
+                            if line.startswith("MIN:"):
+                                min_line = line
+                            elif line.startswith("MAX:"):
+                                max_line = line
+
+                        if min_line and max_line:
                             min_vals = [int(v.strip()) for v in min_line.split(":")[1].split(",")]
-                            for i in range(6):
-                                mins[i] = min_vals[i]
-                        if max_line.startswith("MAX:"):
                             max_vals = [int(v.strip()) for v in max_line.split(":")[1].split(",")]
                             for i in range(6):
+                                mins[i] = min_vals[i]
                                 maxs[i] = max_vals[i]
-                        print(f"Loaded from EEPROM - MIN: {mins}, MAX: {maxs}")
-                        log_event("calibrate_get_response", mins=mins, maxs=maxs)
+                            print(f"✓ Loaded from EEPROM - MIN: {mins}, MAX: {maxs}")
+                            log_event("calibrate_get_response", mins=mins, maxs=maxs)
+                        else:
+                            print(f"⚠ Failed to parse response. Got lines: {lines}")
+                            log_event("calibrate_get_error", error="missing MIN or MAX line", lines=lines)
                     except Exception as e:
-                        print(f"Failed to read EEPROM values: {e}")
+                        print(f"✗ Failed to read EEPROM values: {e}")
                         log_event("calibrate_get_error", error=str(e))
                 elif k == ord('s'):
                     ranges = []
@@ -737,11 +764,13 @@ def run_calibrate(args):
                     log_event("calibrate_next_finger", finger=finger)
                     print(f"→ Next: {finger} ({FINGER_NAMES[finger]})")
                     send_degrees("calibrate_focus_finger")
+                    last_command_time = time.time()  # Reset keep-alive timer
                 elif k == ord('b'):
                     finger = (finger - 1) % 6
                     log_event("calibrate_prev_finger", finger=finger)
                     print(f"→ Back: {finger} ({FINGER_NAMES[finger]})")
                     send_degrees("calibrate_focus_finger")
+                    last_command_time = time.time()  # Reset keep-alive timer
 
                 update_status()
         except KeyboardInterrupt:
